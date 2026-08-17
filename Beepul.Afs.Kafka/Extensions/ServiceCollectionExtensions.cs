@@ -30,6 +30,7 @@ namespace Beepul.Afs.Kafka.Extensions
             services.AddSingleton<IBatchEventHandler<TEvent>, THandler>();
             services.AddHostedService<KafkaBatchConsumerService<TEvent>>();
             return services;
+
         }
     }
 }
