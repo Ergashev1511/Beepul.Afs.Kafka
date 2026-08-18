@@ -1,7 +1,15 @@
-﻿namespace Beepul.Afs.Kafka.Abstractions
+
+namespace Beepul.Afs.Kafka.Abstractions;
+
+public interface IEventPublisher
 {
-    public interface IEventPublisher<T> where T : IKafkaEvent
-    {
-        Task PublishAsync(string topic, T @event);
-    }
+    Task PublishAsync<TPayload>(
+        string topic,
+        KafkaEvent<TPayload> @event,
+        string? key = null,
+        CancellationToken cancellationToken = default);
+
+    Task PublishBatchAsync<TPayload>(
+        IReadOnlyCollection<KafkaPublishRequest<TPayload>> requests,
+        CancellationToken cancellationToken = default);
 }

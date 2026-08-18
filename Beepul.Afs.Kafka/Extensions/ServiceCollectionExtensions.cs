@@ -1,36 +1,62 @@
-﻿using Beepul.Afs.Kafka.Abstractions;
+using Beepul.Afs.Kafka.Abstractions;
 using Beepul.Afs.Kafka.Consuming;
 using Beepul.Afs.Kafka.Options;
 using Beepul.Afs.Kafka.Producing;
+using Beepul.Afs.Kafka.Serialization;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 
-namespace Beepul.Afs.Kafka.Extensions
+namespace Beepul.Afs.Kafka.Extensions;
+
+public static class ServiceCollectionExtensions
 {
-    public static class ServiceCollectionExtensions
+    public static IServiceCollection AddKafkaPublisher(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        string sectionName = KafkaPublisherOptions.DefaultSectionName)
     {
-        public static IServiceCollection AddKafkaPublisher<TEvent>(
-           this IServiceCollection services,
-           IConfiguration config,
-           string sectionName = "Kafka:Publisher")
-           where TEvent : IKafkaEvent
-        {
-            services.Configure<KafkaPublisherOptions>(config.GetSection(sectionName));
-            services.AddSingleton<IEventPublisher<TEvent>, KafkaPublisher<TEvent>>();
-            return services;
-        }
-        public static IServiceCollection AddKafkaBatchConsumer<TEvent, THandler>(
-            this IServiceCollection services,
-            IConfiguration config,
-            string sectionName = "Kafka:Consumer")
-            where TEvent : IKafkaEvent
-            where THandler : class, IBatchEventHandler<TEvent>
-        {
-            services.Configure<KafkaConsumerOptions>(config.GetSection(sectionName));
-            services.AddSingleton<IBatchEventHandler<TEvent>, THandler>();
-            services.AddHostedService<KafkaBatchConsumerService<TEvent>>();
-            return services;
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sectionName);
 
-        }
+        services.AddOptions<KafkaPublisherOptions>()
+            .Bind(configuration.GetSection(sectionName))
+            .ValidateOnStart();
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<IValidateOptions<KafkaPublisherOptions>, KafkaPublisherOptionsValidator>());
+        services.TryAddSingleton<IKafkaEventSerializer, SystemTextJsonKafkaEventSerializer>();
+        services.AddSingleton<IEventPublisher, KafkaPublisher>();
+        return services;
+    }
+
+    public static IServiceCollection AddKafkaBatchConsumer<TPayload, THandler>(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        string sectionName = KafkaConsumerOptions.DefaultSectionName)
+        where THandler : class, IBatchEventHandler<TPayload>
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sectionName);
+
+        services.AddOptions<KafkaConsumerOptions>()
+            .Bind(configuration.GetSection(sectionName))
+            .ValidateOnStart();
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<IValidateOptions<KafkaConsumerOptions>, KafkaConsumerOptionsValidator>());
+        services.TryAddSingleton<IKafkaEventSerializer, SystemTextJsonKafkaEventSerializer>();
+        services.AddSingleton<IBatchEventHandler<TPayload>, THandler>();
+        services.AddHostedService<KafkaBatchConsumerService<TPayload>>();
+        return services;
+    }
+
+    public static IServiceCollection AddKafkaEventSerializer<TSerializer>(this IServiceCollection services)
+        where TSerializer : class, IKafkaEventSerializer
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        services.Replace(ServiceDescriptor.Singleton<IKafkaEventSerializer, TSerializer>());
+        return services;
     }
 }

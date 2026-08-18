@@ -1,17 +1,11 @@
-﻿namespace Beepul.Afs.Kafka.Abstractions
+namespace Beepul.Afs.Kafka.Abstractions;
+
+public abstract class KafkaEventHandler<TPayload> : IBatchEventHandler<TPayload>
 {
-    public abstract class KafkaEventHandler<TEvent> : IBatchEventHandler<TEvent>
-        where TEvent : IKafkaEvent
-    {
-        protected abstract Task HandleBatchAsync(IReadOnlyList<TEvent> batch, CancellationToken ct);
+    public abstract Task HandleAsync(
+        IReadOnlyList<KafkaEvent<TPayload>> batch,
+        CancellationToken cancellationToken);
 
-        Task IBatchEventHandler<TEvent>.HandleAsync(IReadOnlyList<TEvent> batch, CancellationToken ct)
-            => HandleBatchAsync(batch, ct);
-
-        protected PartialBatchFailure Partial(IDictionary<int, Exception> failedIndices)
-            => new PartialBatchFailure(new Dictionary<int, Exception>(failedIndices));
-
-        protected PermanentException Permanent(string message, Exception? inner = null)
-            => new PermanentException(message, inner);
-    }
+    protected static PermanentException Permanent(string message, Exception? innerException = null)
+        => new(message, innerException);
 }

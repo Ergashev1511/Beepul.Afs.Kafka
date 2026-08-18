@@ -1,248 +1,366 @@
-﻿using Beepul.Afs.Kafka.Abstractions;
+using System.Text;
+using Beepul.Afs.Kafka.Abstractions;
 using Beepul.Afs.Kafka.Options;
+using Beepul.Afs.Kafka.Serialization;
 using Confluent.Kafka;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using System.Text;
-using System.Text.Json;
 
-namespace Beepul.Afs.Kafka.Consuming
+namespace Beepul.Afs.Kafka.Consuming;
+
+public sealed class KafkaBatchConsumerService<TPayload> : BackgroundService
 {
-    public class KafkaBatchConsumerService<TEvent> : BackgroundService
-        where TEvent : IKafkaEvent
+    private readonly KafkaConsumerOptions _options;
+    private readonly IBatchEventHandler<TPayload> _handler;
+    private readonly IKafkaEventSerializer _serializer;
+    private readonly ILogger<KafkaBatchConsumerService<TPayload>> _logger;
+    private readonly IProducer<string?, byte[]>? _deadLetterProducer;
+
+    public KafkaBatchConsumerService(
+        IOptions<KafkaConsumerOptions> options,
+        IBatchEventHandler<TPayload> handler,
+        IKafkaEventSerializer serializer,
+        ILogger<KafkaBatchConsumerService<TPayload>> logger)
     {
-        private readonly KafkaConsumerOptions _options;
-        private readonly IBatchEventHandler<TEvent> _handler;
-        private readonly ILogger<KafkaBatchConsumerService<TEvent>> _logger;
-        private readonly IProducer<string, string>? _dlqProducer;
+        ArgumentNullException.ThrowIfNull(options);
+        _options = options.Value;
+        _handler = handler ?? throw new ArgumentNullException(nameof(handler));
+        _serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
-        public KafkaBatchConsumerService(
-            IOptions<KafkaConsumerOptions> options,
-            IBatchEventHandler<TEvent> handler,
-            ILogger<KafkaBatchConsumerService<TEvent>> logger)
+        if (!string.IsNullOrWhiteSpace(_options.DeadLetterTopic))
         {
-            _options = options.Value;
-            _handler = handler;
-            _logger = logger;
-
-            if (!string.IsNullOrEmpty(_options.DlqTopic))
-            {
-                _dlqProducer = new ProducerBuilder<string, string>(new ProducerConfig
-                {
-                    BootstrapServers = _options.BootstrapServers,
-                    Acks = Acks.All,
-                    EnableIdempotence = true
-                }).Build();
-            }
-        }
-
-        protected override Task ExecuteAsync(CancellationToken stoppingToken)
-            => Task.Run(() => RunLoop(stoppingToken), stoppingToken);
-
-        private void RunLoop(CancellationToken ct)
-        {
-            var config = new ConsumerConfig
+            _deadLetterProducer = new ProducerBuilder<string?, byte[]>(new ProducerConfig
             {
                 BootstrapServers = _options.BootstrapServers,
-                GroupId = _options.GroupId,
-                EnableAutoCommit = false,
-                AutoOffsetReset = AutoOffsetReset.Earliest,
-                MaxPollIntervalMs = 300000,
-                PartitionAssignmentStrategy = PartitionAssignmentStrategy.CooperativeSticky
-            };
+                Acks = _options.DeadLetterAcks,
+                EnableIdempotence = _options.DeadLetterEnableIdempotence,
+                MessageTimeoutMs = _options.DeadLetterMessageTimeoutMs
+            }).Build();
+        }
+    }
 
-            using var consumer = new ConsumerBuilder<string, string>(config).Build();
-            consumer.Subscribe(_options.Topic);
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        => Task.Run(() => RunAsync(stoppingToken), stoppingToken);
 
-            _logger.LogInformation("Consumer boshlandi: topic={Topic} group={Group}", _options.Topic, _options.GroupId);
+    private async Task RunAsync(CancellationToken cancellationToken)
+    {
+        using var consumer = BuildConsumer();
+        consumer.Subscribe(_options.Topic);
 
+        _logger.LogInformation(
+            "Kafka consumer started. Topic={Topic}, Group={GroupId}",
+            _options.Topic,
+            _options.GroupId);
+
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var rawBatch = CollectBatch(consumer, cancellationToken);
+                if (rawBatch.Count == 0)
+                    continue;
+
+                await ProcessBatchAsync(consumer, rawBatch, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Normal service shutdown.
+        }
+        finally
+        {
+            consumer.Close();
+        }
+    }
+
+    private IConsumer<string?, byte[]> BuildConsumer()
+    {
+        var config = new ConsumerConfig
+        {
+            BootstrapServers = _options.BootstrapServers,
+            GroupId = _options.GroupId,
+            EnableAutoCommit = false,
+            EnableAutoOffsetStore = false,
+            AutoOffsetReset = _options.AutoOffsetReset,
+            MaxPollIntervalMs = checked((int)_options.MaxPollInterval.TotalMilliseconds),
+            PartitionAssignmentStrategy = _options.PartitionAssignmentStrategy
+        };
+
+        return new ConsumerBuilder<string?, byte[]>(config).Build();
+    }
+
+    private List<ConsumeResult<string?, byte[]>> CollectBatch(
+        IConsumer<string?, byte[]> consumer,
+        CancellationToken cancellationToken)
+    {
+        var batch = new List<ConsumeResult<string?, byte[]>>(
+            Math.Min(_options.MaxBatchSize, _options.InitialBatchCapacity));
+        var totalBytes = 0L;
+        var deadline = DateTime.UtcNow + _options.BatchTimeout;
+
+        while (batch.Count < _options.MaxBatchSize && totalBytes < _options.MaxBatchBytes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+                break;
+
+            var result = consumer.Consume(Min(remaining, _options.ConsumePollInterval));
+            if (result?.Message?.Value is null)
+                continue;
+
+            batch.Add(result);
+            totalBytes += result.Message.Value.LongLength;
+        }
+
+        return batch;
+    }
+
+    private async Task ProcessBatchAsync(
+        IConsumer<string?, byte[]> consumer,
+        List<ConsumeResult<string?, byte[]>> rawBatch,
+        CancellationToken cancellationToken)
+    {
+        // Pause every assigned partition so polling for group membership cannot fetch
+        // records that are not part of the batch currently being processed.
+        var partitions = consumer.Assignment.ToList();
+        consumer.Pause(partitions);
+
+        try
+        {
+            await ProcessPausedBatchAsync(consumer, rawBatch, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            var currentlyAssigned = consumer.Assignment.ToHashSet();
+            var partitionsToResume = partitions.Where(currentlyAssigned.Contains).ToList();
+            if (partitionsToResume.Count > 0)
+                consumer.Resume(partitionsToResume);
+        }
+    }
+
+    private async Task ProcessPausedBatchAsync(
+        IConsumer<string?, byte[]> consumer,
+        List<ConsumeResult<string?, byte[]>> rawBatch,
+        CancellationToken cancellationToken)
+    {
+        var events = new List<KafkaEvent<TPayload>>(rawBatch.Count);
+        var malformed = new List<(ConsumeResult<string?, byte[]> Record, Exception Error)>();
+
+        foreach (var record in rawBatch)
+        {
             try
             {
-                while (!ct.IsCancellationRequested)
-                {
-                    List<ConsumeResult<string, string>> rawBatch;
-                    try
-                    {
-                        rawBatch = CollectBatch(consumer, ct);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Batch fetch xato");
-                        continue;
-                    }
-
-                    if (rawBatch.Count == 0) continue;
-
-                    var items = new List<TEvent>(rawBatch.Count);
-                    var validRaw = new List<ConsumeResult<string, string>>(rawBatch.Count);
-
-                    foreach (var r in rawBatch)
-                    {
-                        try
-                        {
-                            var value = JsonSerializer.Deserialize<TEvent>(r.Message.Value);
-                            if (value != null)
-                            {
-                                items.Add(value);
-                                validRaw.Add(r);
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Deserialize xato, offset={Offset}", r.Offset);
-                            SendToDlq(r, ex);
-                        }
-                    }
-
-                    ProcessWithRetry(consumer, items, validRaw, rawBatch, ct);
-                }
+                events.Add(_serializer.Deserialize<TPayload>(record.Message.Value));
             }
-            finally
+            catch (Exception exception)
             {
-                consumer.Close();
+                malformed.Add((record, exception));
+                _logger.LogError(
+                    exception,
+                    "Kafka event deserialization failed. Topic={Topic}, Partition={Partition}, Offset={Offset}",
+                    record.Topic,
+                    record.Partition.Value,
+                    record.Offset.Value);
             }
         }
 
-        private List<ConsumeResult<string, string>> CollectBatch(IConsumer<string, string> consumer, CancellationToken ct)
+        foreach (var item in malformed)
+            await SendToDeadLetterAsync(item.Record, item.Error, cancellationToken).ConfigureAwait(false);
+
+        if (events.Count > 0)
         {
-            var batch = new List<ConsumeResult<string, string>>(_options.MaxBatchSize);
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-
-            while (batch.Count < _options.MaxBatchSize && sw.ElapsedMilliseconds < _options.BatchTimeoutMs)
+            try
             {
-                ct.ThrowIfCancellationRequested();
-
-                var timeLeft = _options.BatchTimeoutMs - (int)sw.ElapsedMilliseconds;
-                if (timeLeft <= 0) break;
-
-                var result = consumer.Consume(TimeSpan.FromMilliseconds(Math.Min(timeLeft, 200)));
-                if (result?.Message != null)
-                    batch.Add(result);
+                await HandleWithRetryAsync(consumer, events, cancellationToken).ConfigureAwait(false);
             }
-
-            return batch;
+            catch (PermanentException exception)
+            {
+                foreach (var record in rawBatch.Except(malformed.Select(x => x.Record)))
+                    await SendToDeadLetterAsync(record, exception, cancellationToken).ConfigureAwait(false);
+            }
         }
 
-        private void ProcessWithRetry(
-            IConsumer<string, string> consumer,
-            List<TEvent> items,
-            List<ConsumeResult<string, string>> validRaw,
-            List<ConsumeResult<string, string>> rawBatch,
-            CancellationToken ct)
+        await CommitWithRetryAsync(consumer, rawBatch, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task HandleWithRetryAsync(
+        IConsumer<string?, byte[]> consumer,
+        IReadOnlyList<KafkaEvent<TPayload>> events,
+        CancellationToken cancellationToken)
+    {
+        var attempts = 0;
+        var delay = _options.InitialRetryDelay;
+
+        while (true)
         {
-            if (items.Count == 0)
+            cancellationToken.ThrowIfCancellationRequested();
+            try
             {
-                Commit(consumer, rawBatch);
+                var handlerTask = _handler.HandleAsync(events, cancellationToken);
+                await AwaitWithPollingAsync(consumer, handlerTask, cancellationToken).ConfigureAwait(false);
                 return;
             }
-
-            var backoff = _options.InitialBackoffMs;
-            var attempt = 0;
-
-            while (true)
+            catch (PermanentException)
             {
-                try
+                throw;
+            }
+            catch (Exception exception)
+            {
+                attempts++;
+                if (_options.MaxRetryAttempts > 0 && attempts >= _options.MaxRetryAttempts)
                 {
-                    _handler.HandleAsync(items, ct).GetAwaiter().GetResult();
-                    Commit(consumer, rawBatch);
-                    return;
+                    _logger.LogCritical(
+                        exception,
+                        "Batch processing stopped after {AttemptCount} attempts. Offsets were not committed.",
+                        attempts);
+                    throw new InvalidOperationException(
+                        "Kafka batch processing retries were exhausted. Offsets were not committed.",
+                        exception);
                 }
-                catch (PartialBatchFailure pf)
-                {
-                    foreach (var (idx, ex) in pf.FailedIndices)
-                    {
-                        if (idx >= 0 && idx < validRaw.Count)
-                            SendToDlq(validRaw[idx], ex);
-                    }
-                    Commit(consumer, rawBatch);
-                    return;
-                }
-                catch (PermanentException ex)
-                {
-                    foreach (var r in validRaw) SendToDlq(r, ex);
-                    Commit(consumer, rawBatch);
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    attempt++;
-                    if (_options.MaxRetries > 0 && attempt > _options.MaxRetries)
-                    {
-                        _logger.LogError(ex, "Max retries tugadi, {Count} ta xabar DLQ'ga yuborilmoqda", validRaw.Count);
-                        foreach (var r in validRaw) SendToDlq(r, ex);
-                        Commit(consumer, rawBatch);
-                        return;
-                    }
 
-                    _logger.LogWarning(ex, "Batch xato (urinish {Attempt}/{Max}), {Backoff}ms dan keyin qayta uriniladi",
-                        attempt, _options.MaxRetries, backoff);
+                _logger.LogWarning(
+                    exception,
+                    "Batch processing failed. Attempt={Attempt}, RetryDelayMs={RetryDelayMs}",
+                    attempts,
+                    delay.TotalMilliseconds);
 
-                    Thread.Sleep(backoff);
-                    backoff = Math.Min(backoff * 2, _options.MaxBackoffMs);
-                }
+                await DelayWithPollingAsync(consumer, delay, cancellationToken).ConfigureAwait(false);
+                delay = CalculateNextDelay(delay);
             }
         }
+    }
 
-        private void Commit(IConsumer<string, string> consumer, List<ConsumeResult<string, string>> rawBatch)
+    private async Task CommitWithRetryAsync(
+        IConsumer<string?, byte[]> consumer,
+        IReadOnlyCollection<ConsumeResult<string?, byte[]>> rawBatch,
+        CancellationToken cancellationToken)
+    {
+        var offsets = rawBatch
+            .GroupBy(record => record.TopicPartition)
+            .Select(group => new TopicPartitionOffset(
+                group.Key,
+                new Offset(group.Max(record => record.Offset.Value) + 1)))
+            .ToList();
+
+        while (true)
         {
-            if (rawBatch.Count == 0) return;
-
-            var offsets = rawBatch
-                .GroupBy(r => r.TopicPartition)
-                .Select(g => new TopicPartitionOffset(g.Key, g.Max(x => x.Offset.Value) + 1))
-                .ToList();
-
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 consumer.Commit(offsets);
-            }
-            catch (KafkaException ex)
-            {
-                _logger.LogError(ex, "Commit xato");
-            }
-        }
-
-        private void SendToDlq(ConsumeResult<string, string> r, Exception ex)
-        {
-            if (_dlqProducer == null)
-            {
-                _logger.LogError("DLQ sozlanmagan! Xabar tashlab yuborildi. offset={Offset} error={Error}", r.Offset, ex.Message);
                 return;
             }
-
-            var headers = new Headers
+            catch (KafkaException exception)
             {
-                { "x-dlq-reason", Encoding.UTF8.GetBytes(ex.Message) },
-                { "x-dlq-original-topic", Encoding.UTF8.GetBytes(r.Topic) },
-                { "x-dlq-original-partition", Encoding.UTF8.GetBytes(r.Partition.Value.ToString()) },
-                { "x-dlq-original-offset", Encoding.UTF8.GetBytes(r.Offset.Value.ToString()) }
-            };
-
-            try
-            {
-                _dlqProducer.Produce(_options.DlqTopic, new Message<string, string>
-                {
-                    Key = r.Message.Key,
-                    Value = r.Message.Value,
-                    Headers = headers
-                });
-            }
-            catch (Exception dlqEx)
-            {
-                _logger.LogError(dlqEx, "DLQ'ga yozib bo'lmadi, offset={Offset}", r.Offset);
+                _logger.LogError(exception, "Kafka offset commit failed; retrying without consuming new records.");
+                await DelayWithPollingAsync(consumer, _options.CommitRetryDelay, cancellationToken)
+                    .ConfigureAwait(false);
             }
         }
+    }
 
-        public override void Dispose()
+    private async Task AwaitWithPollingAsync(
+        IConsumer<string?, byte[]> consumer,
+        Task operation,
+        CancellationToken cancellationToken)
+    {
+        while (!operation.IsCompleted)
         {
-            _dlqProducer?.Flush(TimeSpan.FromSeconds(5));
-            _dlqProducer?.Dispose();
-            base.Dispose();
+            var pollingDelay = Task.Delay(_options.ProcessingPollInterval, cancellationToken);
+            var completed = await Task.WhenAny(operation, pollingDelay).ConfigureAwait(false);
+            if (completed == operation)
+                break;
+
+            consumer.Consume(TimeSpan.Zero);
         }
+
+        await operation.ConfigureAwait(false);
+    }
+
+    private async Task DelayWithPollingAsync(
+        IConsumer<string?, byte[]> consumer,
+        TimeSpan delay,
+        CancellationToken cancellationToken)
+    {
+        var deadline = DateTime.UtcNow + delay;
+        while (DateTime.UtcNow < deadline)
+        {
+            var remaining = deadline - DateTime.UtcNow;
+            await Task.Delay(Min(remaining, _options.ProcessingPollInterval), cancellationToken)
+                .ConfigureAwait(false);
+            consumer.Consume(TimeSpan.Zero);
+        }
+    }
+
+    private async Task SendToDeadLetterAsync(
+        ConsumeResult<string?, byte[]> record,
+        Exception exception,
+        CancellationToken cancellationToken)
+    {
+        if (_deadLetterProducer is null || string.IsNullOrWhiteSpace(_options.DeadLetterTopic))
+        {
+            throw new InvalidOperationException(
+                "A permanent Kafka event failure occurred, but DeadLetterTopic is not configured. " +
+                "The offset will not be committed.",
+                exception);
+        }
+
+        var message = new Message<string?, byte[]>
+        {
+            Key = record.Message.Key,
+            Value = record.Message.Value,
+            Headers = CopyHeaders(record.Message.Headers)
+        };
+        AddDeadLetterHeaders(message.Headers, record, exception);
+
+        var result = await _deadLetterProducer
+            .ProduceAsync(_options.DeadLetterTopic, message, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (result.Status != PersistenceStatus.Persisted)
+        {
+            throw new KafkaException(new Error(
+                ErrorCode.Local_MsgTimedOut,
+                $"Dead-letter event at {record.TopicPartitionOffset} was not persisted."));
+        }
+    }
+
+    private static Headers CopyHeaders(Headers? source)
+    {
+        var result = new Headers();
+        if (source is null)
+            return result;
+
+        foreach (var header in source)
+            result.Add(header.Key, header.GetValueBytes());
+        return result;
+    }
+
+    private static void AddDeadLetterHeaders(
+        Headers headers,
+        ConsumeResult<string?, byte[]> record,
+        Exception exception)
+    {
+        headers.Add("dlq-reason", Encoding.UTF8.GetBytes(exception.Message));
+        headers.Add("dlq-original-topic", Encoding.UTF8.GetBytes(record.Topic));
+        headers.Add("dlq-original-partition", Encoding.UTF8.GetBytes(record.Partition.Value.ToString()));
+        headers.Add("dlq-original-offset", Encoding.UTF8.GetBytes(record.Offset.Value.ToString()));
+    }
+
+    private static TimeSpan Min(TimeSpan left, TimeSpan right) => left <= right ? left : right;
+
+    private TimeSpan CalculateNextDelay(TimeSpan current) => TimeSpan.FromMilliseconds(
+        Math.Min(
+            current.TotalMilliseconds * _options.RetryBackoffMultiplier,
+            _options.MaxRetryDelay.TotalMilliseconds));
+
+    public override void Dispose()
+    {
+        _deadLetterProducer?.Flush(_options.DeadLetterFlushTimeout);
+        _deadLetterProducer?.Dispose();
+        base.Dispose();
     }
 }
